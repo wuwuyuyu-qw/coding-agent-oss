@@ -28,11 +28,6 @@
 
 ## Architecture | 架构
 
-### Diagram placeholder | 架构图占位
-
-> **EN:** Drop your canonical diagram here (`docs/architecture.png`) or render Mermaid on GitHub.  
-> **CN:** 建议在此处放置正式架构图（PNG/SVG）或直接使用下方 Mermaid（GitHub 原生渲染）。
-
 ```mermaid
 flowchart LR
   A[Actor / LLM] --> B[Sandbox / Docker]
