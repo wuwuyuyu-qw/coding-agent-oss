@@ -1,0 +1,65 @@
+# ============================================================
+# .coveragerc —— coverage.py 配置
+#
+# [Design Rationale] 为什么把 coverage 配置单独放文件而不是塞 pytest.ini？
+#   - coverage.py 的配置在很多工具链里被复用（tox, nox, CI 脚本），
+#     独立文件能被非 pytest 入口直接读取；
+#   - pyproject.toml 也可以，但本项目还没 pyproject，保持最小依赖。
+# ============================================================
+
+[run]
+# 只统计我们自己写的代码，不统计三方库和测试文件本身
+source =
+    core
+    main
+
+# 明确排除不该统计的路径
+omit =
+    */tests/*
+    */.venv/*
+    */__pycache__/*
+
+# branch coverage = 除了"每行是否执行"，
+# 还要统计"每个 if/else 分支是否都走过"。比纯 line coverage 更严格，
+# 能发现"我只测了 happy path"的潜在盲区。
+branch = True
+
+
+[report]
+# 缺失的行显示具体行号，方便定位
+show_missing = True
+
+# 只报告两位小数，避免 "79.99%" 四舍五入成 80% 骗过门槛
+precision = 2
+
+# 按覆盖率升序排列，红牌最显眼
+sort = Cover
+
+# [Design Rationale] exclude_lines 是"模式排除"，凡匹配正则的行都不计入。
+# 这些都是行业惯例（coverage.py 官方文档推荐）。
+exclude_lines =
+    # 标准的"显式跳过"标记——允许开发者手动打 pragma
+    pragma: no cover
+
+    # 抽象方法定义（无实现体）
+    @abstractmethod
+    raise NotImplementedError
+
+    # Python 双下方法，通常不会在业务测试中触发
+    def __repr__
+    def __str__
+
+    # 纯类型检查的 import 分支（运行时不执行）
+    if TYPE_CHECKING:
+    if typing\.TYPE_CHECKING:
+
+    # 脚本入口，单测不应跑 __main__
+    if __name__ == .__main__.:
+
+    # defensive re-raise ——panic 分支通常没法在单测里触发
+    raise AssertionError
+
+# 当某一行是多语句（a; b; c）时把它当一个覆盖单元，
+# 避免"分号分割的一行漏测一半"的假阳性
+[html]
+directory = htmlcov

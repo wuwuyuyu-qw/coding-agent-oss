@@ -1,0 +1,135 @@
+# ============================================================
+# .github/workflows/ci.yml —— Self-Healing Agent CI 流水线
+# ------------------------------------------------------------
+# [Design Rationale] CI 的目标不是"跑一次绿"，而是建立「每次合入都自动可信」的
+# 质量基线。本 pipeline 定义了 4 道闸门，任一不通过则阻止合入：
+#     ① 代码能 import（无语法错误）
+#     ② 所有 pytest 用例通过
+#     ③ 分支覆盖率 ≥ 80%
+#     ④ 在三个支持的 Python 版本上全部绿
+#
+# 命名规范 & 可观测性：
+#   - 每个 step 都有 name，便于在 GitHub UI 里一眼看到失败在哪步；
+#   - upload 覆盖率 artifact，让 PR reviewer 可以下载 HTML 报告；
+#   - matrix 策略 fail-fast=false，让你一次看到"哪个 py 版本挂了"。
+# ============================================================
+
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # 允许在 Actions 页面手动触发，用于 hotfix 调试。
+  workflow_dispatch:
+
+# [Design Rationale] concurrency 保证同一分支的新 push 会自动取消旧 run，
+# 省 CI 分钟数 + 避免"旧结果污染 PR 状态"。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # fail-fast: false —— 让所有 matrix 分支都跑完，
+      # 否则 3.10 挂了会立刻取消 3.11、3.12，损失诊断信息。
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10", "3.11", "3.12" ]
+
+    steps:
+      # ---- Step 1: 拉代码 ----
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---- Step 2: 装 Python ----
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          # 启用 pip cache 能省 30~60 秒 / job / 版本。
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # ---- Step 3: 装依赖 ----
+      # [Design Rationale] 为什么不用 pipenv/poetry？
+      #   - 项目规模小，pip + requirements.txt 够用；
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # ---- Step 4: 冒烟检查（快速失败）----
+      # 在跑耗时测试之前先做"能不能 import"这种 ms 级检查，
+      # 拼写错误这类问题能在 5 秒内失败而不是 3 分钟后。
+      - name: Smoke check (module imports)
+        run: |
+          python -c "import main; import core.nodes; import core.sandbox; import core.router; import core.state; print('All modules imported OK')"
+
+      # ---- Step 5: 跑完整测试套件 + 覆盖率门槛 ----
+      # --cov-fail-under=80 已经在 pytest.ini 里配置，
+      # 这里显式再写一遍可以 override（比如 release 分支要求 90%）。
+      # 输出 xml + html：xml 给 codecov 上传，html 给人工浏览。
+      - name: Run tests with coverage gate (>= 80%)
+        run: |
+          pytest \
+            --cov=core \
+            --cov=main \
+            --cov-branch \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --cov-fail-under=80
+
+      # ---- Step 6: 上传覆盖率 artifact（不管成功失败都上传）----
+      # if: always() 让失败时也能拿到报告诊断，
+      # 否则 coverage 掉到 79% 挂掉时你反而看不到详情。
+      - name: Upload coverage HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html-py${{ matrix.python-version }}
+          path: htmlcov/
+          retention-days: 14
+
+      - name: Upload coverage XML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 14
+
+      # ---- Step 7（可选）: 上传到 Codecov / Coveralls ----
+      # [Design Rationale] 注释掉但保留示例：接第三方覆盖率服务只需要 3 行，
+      # PR 里就能自动评论"这个 PR 让 foo.py 覆盖率下降了 3%"。
+      # 需要先在 https://app.codecov.io 注册项目、拿到 token 后启用。
+      # - name: Upload coverage to Codecov
+      #   uses: codecov/codecov-action@v4
+      #   with:
+      #     files: ./coverage.xml
+      #     token: ${{ secrets.CODECOV_TOKEN }}
+      #     fail_ci_if_error: true
+
+  # 单独一个汇总 job，接到 branch protection 就只用 require 这一个
+  # check 名字，避免 matrix 展开后每个版本都要单独设为 required check。
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [ test ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all matrix jobs passed
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "::error::Test matrix failed"
+            exit 1
+          fi
+          echo "All matrix jobs passed."

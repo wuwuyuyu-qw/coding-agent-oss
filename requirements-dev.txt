@@ -1,0 +1,22 @@
+# ============================================================
+# requirements-dev.txt —— 仅开发/CI 需要的依赖。
+#
+# [Design Rationale] 为什么和 requirements.txt 分开？
+#   - 生产镜像没必要装 pytest（占空间 + 潜在攻击面）；
+#   - CI 和本地开发才需要这些工具；
+#   - 标准做法：`pip install -r requirements.txt -r requirements-dev.txt`
+#     开发机完整装；`pip install -r requirements.txt` 生产只装运行时。
+# ============================================================
+
+# 先装所有运行时依赖
+-r requirements.txt
+
+# --- 测试框架 ---
+# pytest 是事实标准，pinning 到 >=7.0 是为了用新的 importmode。
+pytest>=7.0
+pytest-asyncio>=0.24.0
+# monkeypatch 增强 / fake 对象构造助手
+pytest-mock>=3.0
+# 覆盖率工具：pytest-cov 是 pytest 对 coverage.py 的桥接，
+# 支持 --cov-fail-under 等质量门禁。
+pytest-cov>=5.0

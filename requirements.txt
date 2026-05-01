@@ -1,0 +1,40 @@
+# ============================================================
+# Self-Healing PR Agent - Python 依赖清单
+# ------------------------------------------------------------
+# [Design Rationale] 为什么所有依赖都用 ">=" 而不是 "==" 死锁？
+#   - 真正的生产项目应该使用 pip-tools / uv 生成 requirements.lock
+#     来固化整套传递依赖（transitive deps）的 hash。
+# ============================================================
+
+# --- 编排框架：LangGraph 状态机 ---
+# LangGraph 是 LangChain 团队针对 "Agent 控制流不可控" 痛点
+# 推出的有向图状态机框架，核心抽象是 StateGraph + Conditional Edges。
+# 它和 LangChain 的最大差异：LangGraph 显式建模"节点之间的跳转"，
+# 让 Agent 不再是"无限对话循环"，而是"可审计的状态机执行"。
+langgraph>=0.2.50
+langchain-core>=0.3.0
+
+# --- 大模型客户端：OpenAI SDK (1.x) ---
+# [Design Rationale] 为什么用 openai 而不是直接 requests?
+#   - 1.x SDK 内置了重试、指数退避、流式解析、超时控制。
+#   - 通过 base_url 参数可无缝切到 DeepSeek / Moonshot / 通义 / vLLM 自部署，
+#     这是国内做 Agent 项目最常见的"一键换模型"方案。
+openai>=1.50.0
+
+# --- 沙盒：Docker SDK ---
+# 为什么不用 subprocess 跑 LLM 输出的代码？
+#   - subprocess 与宿主机共享文件系统、网络、PID 命名空间。
+#     LLM 写一行 `os.system("rm -rf ~")` 你就毁了。
+#   - Docker 提供 cgroup（CPU/内存）+ namespace（网络/PID/UID）双重隔离。
+docker>=7.1.0
+
+# --- 数据校验 ---
+# [Design Rationale] 我们用 TypedDict 定义 LangGraph 状态（轻量、原生支持），
+# 用 Pydantic 校验 LLM 的结构化输出（防止幻觉返回脏数据）。
+pydantic>=2.7.0
+typing-extensions>=4.10.0
+
+# --- 配置加载 ---
+# .env 文件 + python-dotenv 是 12-Factor App 的标准做法，
+# 把"代码"和"配置/密钥"彻底分离，杜绝 API Key 进 Git 历史。
+python-dotenv>=1.0.0
