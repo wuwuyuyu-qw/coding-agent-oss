@@ -144,3 +144,21 @@ class AgentState(TypedDict, total=False):
     """是否允许执行测试工具"""
     enable_test_tool: bool
     """默认不执行 run_tests；调用方必须显式开启。"""
+
+    # ---------- Patch Engine + Diff Audit（可选输出） ----------
+
+    """解析后的 patch plan"""
+    patch_plan: dict[str, Any]
+    """过程字段。记录 PatchParser 输出，便于审计与报告。"""
+
+    """patch 校验结果"""
+    patch_validation: dict[str, Any]
+    """过程字段。记录 PatchValidator 结果。"""
+
+    """patch 应用结果"""
+    patch_apply_result: dict[str, Any]
+    """过程字段。记录 dry-run/apply/rollback 结果。"""
+
+    """patch diff 审计"""
+    patch_audit: dict[str, Any]
+    """过程字段。记录 git diff audit 结果。"""

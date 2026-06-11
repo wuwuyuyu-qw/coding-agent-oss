@@ -21,6 +21,11 @@ import httpx
 from openai import APIError as OpenAIAPIError
 from openai import APITimeoutError, AsyncOpenAI, RateLimitError
 
+from patching.applier import PatchApplier
+from patching.diff_audit import DiffAuditor
+from patching.errors import PatchEngineError
+from patching.parser import PatchParser
+from patching.validator import PatchValidator
 from rag.context_builder import ContextBuilder as RagContextBuilder
 from rag.hybrid_retriever import HybridRetriever
 from tools.builtin_tools import build_default_registry
@@ -33,6 +38,14 @@ from .sandbox import SandboxResult, run_in_sandbox_async
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+class _PatchEngineNodeError(ValueError):
+    """Patch Engine failure carrying state fields for LangGraph."""
+
+    def __init__(self, message: str, state_update: dict[str, Any]):
+        super().__init__(message)
+        self.state_update = state_update
 
 # ============================================================
 # LLM 异步客户端（进程级单例 + AsyncClient 连接池）
@@ -390,6 +403,73 @@ def _build_tool_calling_context(state: AgentState, *, error_log: str) -> tuple[s
         metadata["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
 
+def _apply_patch_with_engine(
+    *,
+    state: AgentState,
+    base_code: str,
+    raw_text: str,
+) -> tuple[str, dict[str, Any]]:
+    """Apply LLM patch output through repo-aware Patch Engine when possible."""
+
+    repo_root = (state.get("repo_root") or "").strip()
+    target_file = (state.get("target_file") or "").strip()
+    empty = {
+        "patch_plan": {},
+        "patch_validation": {},
+        "patch_apply_result": {},
+        "patch_audit": {},
+    }
+    if not repo_root or not target_file:
+        return merge_patches_into_code(base_code, raw_text), empty
+
+    try:
+        plan = PatchParser().parse(
+            raw_text,
+            repo_root=repo_root,
+            default_target_file=target_file,
+        )
+        validation = PatchValidator().validate(plan, repo_root=repo_root)
+        if not validation.valid:
+            raise ValueError("; ".join(validation.errors))
+
+        applier = PatchApplier()
+        dry_run = applier.dry_run(plan, repo_root=repo_root)
+        if not dry_run.success:
+            raise ValueError(dry_run.error)
+
+        apply_result = applier.apply(plan, repo_root=repo_root)
+        audit = DiffAuditor().audit(
+            repo_root=repo_root,
+            patch_id=plan.patch_id,
+            files_before_hash=apply_result.metadata.get("files_before_hash", {}),
+            files_after_hash=apply_result.metadata.get("files_after_hash", {}),
+        )
+        if not apply_result.success:
+            raise ValueError(apply_result.error)
+
+        target_path = Path(repo_root) / target_file
+        current_code = target_path.read_text(encoding="utf-8")
+        return current_code, {
+            "patch_plan": plan.to_dict(),
+            "patch_validation": validation.to_dict(),
+            "patch_apply_result": apply_result.to_dict(),
+            "patch_audit": audit.to_dict(),
+        }
+    except (PatchEngineError, OSError, UnicodeDecodeError, ValueError) as exc:
+        logger.warning("[PatchEngine] failed; attempting safe single-file fallback: %s", exc)
+        state_update = {
+            "patch_plan": {},
+            "patch_validation": {"valid": False, "errors": [str(exc)]},
+            "patch_apply_result": {"success": False, "error": str(exc), "fallback": "single_file_merge"},
+            "patch_audit": {},
+        }
+        if "search_not_unique" not in str(exc):
+            merged = merge_patches_into_code(base_code, raw_text)
+            return merged, state_update
+        state_update["patch_apply_result"]["fallback"] = "previous_code"
+        raise _PatchEngineNodeError(str(exc), state_update) from exc
+
+
 # ============================================================
 # 节点 1：Actor (生成 / 反思修复)
 # ============================================================
@@ -513,17 +593,27 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
         }
 
     try:
-        # [核心] 合并 LLM 输出的 patch 到 base_code，内部包含 search/replace 边界强校验
-        merged = merge_patches_into_code(base_code, raw_text)
+        # [核心] 合并 LLM 输出的 patch。repo_root 存在时走 Patch Engine；否则保持原单文件流程。
+        merged, patch_state_update = _apply_patch_with_engine(
+            state=state,
+            base_code=base_code,
+            raw_text=raw_text,
+        )
     except ValueError as e:
         # [架构层] 补丁不合规或全局替换，直接 fail fast，不让 LLM 弄乱底层代码
         logger.warning("[Actor] 补丁解析/合并失败：%s", e)
+        patch_error_update = (
+            e.state_update
+            if isinstance(e, _PatchEngineNodeError)
+            else {"patch_apply_result": {"success": False, "error": str(e)}}
+        )
         return {
             "current_code": base_code,   # 回退上一个可用代码
             "error_log": f"[Patch Merge Failed] {e}",
             "retry_count": retry_count + 1,
             **rag_state_update,
             **tool_state_update,
+            **patch_error_update,
         }
 
     # [终极返回] 补丁合并通过，记录 retry 供 LangGraph 状态追踪
@@ -533,6 +623,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
         "retry_count": retry_count + 1,  # [架构层] 必须自增，为 Router 熔断提供计数支撑
         **rag_state_update,
         **tool_state_update,
+        **patch_state_update,
     }
 
 
