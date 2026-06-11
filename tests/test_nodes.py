@@ -176,6 +176,23 @@ class TestGenerateAndFixNodeDefensive:
         assert out["retry_count"] == 1
         assert "Patch Merge Failed" in out["error_log"]
 
+    @pytest.mark.asyncio
+    async def test_missing_repo_root_falls_back_to_original_flow(
+        self, patch_llm, tmp_path, base_state
+    ):
+        fake = await patch_llm(
+            content=_patch_response("def f(x): return x", "def f(x): return x + 1")
+        )
+        state = {**base_state, "repo_root": str(tmp_path / "missing")}
+
+        out = await nodes.generate_and_fix_node(state)
+
+        assert out["current_code"].strip() == "def f(x): return x + 1"
+        assert out["rag_context"] == ""
+        assert out["rag_metadata"]["enabled"] is False
+        assert out["rag_metadata"]["reason"] == "repo_root_not_found"
+        assert "[Repo-level Evidence Context]" not in fake.last_kwargs["messages"][1]["content"]
+
 
 @pytest.fixture
 def patch_sandbox(monkeypatch):

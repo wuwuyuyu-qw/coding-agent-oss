@@ -13,11 +13,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from pathlib import Path
 from typing import Any
 
 import httpx
 from openai import APIError as OpenAIAPIError
 from openai import APITimeoutError, AsyncOpenAI, RateLimitError
+
+from rag.context_builder import ContextBuilder
+from rag.hybrid_retriever import HybridRetriever
 
 from .patch_apply import merge_patches_into_code
 from .sandbox import SandboxResult, run_in_sandbox_async
@@ -214,6 +219,62 @@ _USER_PROMPT_TEMPLATE = """[原始代码（锚点，只读）]
 """
 
 
+def _build_repo_rag_context(state: AgentState, *, error_log: str) -> tuple[str, dict[str, Any]]:
+    """Build optional repo-level evidence context with fail-open behavior."""
+
+    repo_root = (state.get("repo_root") or "").strip()
+    metadata: dict[str, Any] = {
+        "enabled": False,
+        "indexed_file_count": 0,
+        "retrieved_chunk_count": 0,
+        "top_evidence_files": [],
+        "elapsed_ms": 0.0,
+        "reason": "repo_root_missing",
+    }
+    if not repo_root:
+        return "", metadata
+
+    started = time.perf_counter()
+    try:
+        root_path = Path(repo_root)
+        if not root_path.exists() or not root_path.is_dir():
+            metadata["reason"] = "repo_root_not_found"
+            return "", metadata
+
+        retriever = HybridRetriever()
+        results = retriever.retrieve(
+            user_request=state.get("user_request", ""),
+            error_log=error_log,
+            failing_tests=state.get("failing_tests", []),
+            target_file=state.get("target_file", ""),
+            repo_root=str(root_path),
+            top_k=5,
+        )
+        context = ContextBuilder(max_context_chars=8000).build_context(
+            user_request=state.get("user_request", ""),
+            error_log=error_log,
+            results=results,
+            failing_tests=state.get("failing_tests", []),
+            target_file=state.get("target_file", ""),
+        )
+        metadata.update(
+            {
+                "enabled": True,
+                "indexed_file_count": retriever.indexed_file_count,
+                "retrieved_chunk_count": len(results),
+                "top_evidence_files": [item.chunk.file_path for item in results[:3]],
+                "reason": "ok",
+            }
+        )
+        return context, metadata
+    except Exception as exc:  # pragma: no cover - exact failures are environment-specific.
+        metadata["reason"] = f"rag_failed:{type(exc).__name__}"
+        logger.warning("[RAG] Repo-level retrieval failed; falling back without RAG: %s", exc)
+        return "", metadata
+    finally:
+        metadata["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+
+
 # ============================================================
 # 节点 1：Actor (生成 / 反思修复)
 # ============================================================
@@ -251,6 +312,24 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
         current_code=base_code,                # 当前补丁基线，search 匹配从这里起步
         test_code=state["test_code"],          # 必须通过的测试用例，这个设计很像 Codex/Reflexion 论文实践
     )
+    rag_context, rag_metadata = _build_repo_rag_context(state, error_log=error_log)
+    rag_state_update = {"rag_context": rag_context, "rag_metadata": rag_metadata}
+    if rag_context:
+        user_prompt = (
+            f"{user_prompt}\n\n"
+            "[Repo-level Evidence Context]\n"
+            f"{rag_context}\n"
+        )
+        logger.info(
+            "[RAG] enabled=%s indexed_files=%d retrieved_chunks=%d top_files=%s elapsed_ms=%.2f",
+            rag_metadata.get("enabled"),
+            rag_metadata.get("indexed_file_count", 0),
+            rag_metadata.get("retrieved_chunk_count", 0),
+            rag_metadata.get("top_evidence_files", []),
+            rag_metadata.get("elapsed_ms", 0.0),
+        )
+    elif state.get("repo_root"):
+        logger.info("[RAG] disabled reason=%s", rag_metadata.get("reason"))
 
     # --------- 获取“异步 LLM 客户端”全局实例 ----------
     client = await _get_llm_client()  # [语法层] 异步懒加载，用单例锁防止多协程脏实例；内部搞定连接池
@@ -277,6 +356,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "current_code": base_code,    # 回退原代码，防失联
             "error_log": f"[LLM Call Failed] {type(e).__name__}: {e}",  # 明确告知异常
             "retry_count": retry_count + 1,
+            **rag_state_update,
         }
 
     # -------- 业务核心：补丁输出后处理 ----------
@@ -289,6 +369,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "current_code": base_code,
             "error_log": "",  # 不记故障但递进 retry
             "retry_count": retry_count + 1,
+            **rag_state_update,
         }
 
     try:
@@ -301,6 +382,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "current_code": base_code,   # 回退上一个可用代码
             "error_log": f"[Patch Merge Failed] {e}",
             "retry_count": retry_count + 1,
+            **rag_state_update,
         }
 
     # [终极返回] 补丁合并通过，记录 retry 供 LangGraph 状态追踪
@@ -308,6 +390,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
         "current_code": merged,  # [语法/业务] 合并后的最新代码
         "error_log": "",         # 本轮无报错，留空明示
         "retry_count": retry_count + 1,  # [架构层] 必须自增，为 Router 熔断提供计数支撑
+        **rag_state_update,
     }
 
 

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 
 # ============================================================
@@ -92,3 +92,29 @@ class AgentState(TypedDict, total=False):
     [Design Rationale] 之所以不用 bool，是为了未来扩展更多终态
     （比如 "sandbox_unavailable" / "llm_quota_exceeded"），
     枚举字符串比 bool 更面向未来。"""
+
+    # ---------- Repo-level RAG（可选输入与观测输出） ----------
+
+    """用户任务描述"""
+    user_request: str
+    """可选。用于 Repo-level RAG 检索；缺失时仍保持原有单文件流程。"""
+
+    """本地仓库根目录"""
+    repo_root: str
+    """可选。存在且可访问时启用 Repo-level RAG；否则自动降级。"""
+
+    """当前待修复文件路径"""
+    target_file: str
+    """可选。用于提升目标文件和栈路径命中的召回权重。"""
+
+    """失败测试名称列表"""
+    failing_tests: list[str]
+    """可选。用于召回相关测试文件和测试函数。"""
+
+    """Repo-level RAG 注入给 LLM 的上下文"""
+    rag_context: str
+    """过程字段。检索成功时保存 Evidence Context，方便报告或调试。"""
+
+    """Repo-level RAG 运行元数据"""
+    rag_metadata: dict[str, Any]
+    """过程字段。记录是否启用、索引文件数、召回 chunk 数、耗时等信息。"""
