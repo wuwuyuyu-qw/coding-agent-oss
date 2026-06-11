@@ -1,0 +1,14 @@
+{
+  "task_id": "toy_divide_by_zero",
+  "title": "Fix divide by zero handling",
+  "repo_root": "toy_divide_by_zero/repo",
+  "target_file": "calculator.py",
+  "user_request": "Fix divide by zero behavior.",
+  "error_log": "ZeroDivisionError: division by zero",
+  "failing_tests": ["tests/test_calculator.py::test_divide_by_zero"],
+  "test_command": "pytest",
+  "max_iterations": 3,
+  "expected_success": true,
+  "tags": ["python", "runtime-error", "single-file"],
+  "difficulty": "easy"
+}

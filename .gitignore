@@ -49,6 +49,7 @@ logs/
 # 自动化评估端到端跑出来的基准测试结果 (避免大量冗余数据)
 eval_results/
 benchmark_outputs/
+benchmark/results/
 *.jsonl
 
 # ==========================================
