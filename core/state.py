@@ -118,3 +118,29 @@ class AgentState(TypedDict, total=False):
     """Repo-level RAG 运行元数据"""
     rag_metadata: dict[str, Any]
     """过程字段。记录是否启用、索引文件数、召回 chunk 数、耗时等信息。"""
+
+    # ---------- Tool Calling Framework（可选输入与观测输出） ----------
+
+    """工具上下文"""
+    tool_context: str
+    """过程字段。deterministic pre-patch tool pass 生成的 prompt 上下文。"""
+
+    """工具调用轨迹"""
+    tool_trace: dict[str, Any]
+    """过程字段。包含 tool calls/results、总耗时、成功/失败数量。"""
+
+    """工具运行元数据"""
+    tool_metadata: dict[str, Any]
+    """过程字段。记录是否启用、执行工具数、失败数、跳过原因等。"""
+
+    """工具结果列表"""
+    tool_results: list[dict[str, Any]]
+    """过程字段。序列化后的 ToolResult 列表，便于报告展示。"""
+
+    """可选测试命令"""
+    test_command: str
+    """仅当 enable_test_tool 为 true 时，run_tests 才会执行该命令。"""
+
+    """是否允许执行测试工具"""
+    enable_test_tool: bool
+    """默认不执行 run_tests；调用方必须显式开启。"""
