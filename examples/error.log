@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "examples/buggy_project/tests/test_calculator.py", line 5, in test_divide_by_zero_returns_zero
+    assert divide(1, 0) == 0
+  File "examples/buggy_project/calculator.py", line 2, in divide
+    return a / b
+ZeroDivisionError: division by zero
