@@ -21,8 +21,12 @@ import httpx
 from openai import APIError as OpenAIAPIError
 from openai import APITimeoutError, AsyncOpenAI, RateLimitError
 
-from rag.context_builder import ContextBuilder
+from rag.context_builder import ContextBuilder as RagContextBuilder
 from rag.hybrid_retriever import HybridRetriever
+from tools.builtin_tools import build_default_registry
+from tools.context_builder import ToolContextBuilder
+from tools.executor import ToolExecutor
+from tools.models import ToolCall
 
 from .patch_apply import merge_patches_into_code
 from .sandbox import SandboxResult, run_in_sandbox_async
@@ -250,7 +254,7 @@ def _build_repo_rag_context(state: AgentState, *, error_log: str) -> tuple[str, 
             repo_root=str(root_path),
             top_k=5,
         )
-        context = ContextBuilder(max_context_chars=8000).build_context(
+        context = RagContextBuilder(max_context_chars=8000).build_context(
             user_request=state.get("user_request", ""),
             error_log=error_log,
             results=results,
@@ -271,6 +275,117 @@ def _build_repo_rag_context(state: AgentState, *, error_log: str) -> tuple[str, 
         metadata["reason"] = f"rag_failed:{type(exc).__name__}"
         logger.warning("[RAG] Repo-level retrieval failed; falling back without RAG: %s", exc)
         return "", metadata
+    finally:
+        metadata["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
+
+
+def _build_tool_calling_context(state: AgentState, *, error_log: str) -> tuple[str, dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Run deterministic pre-patch tools and build prompt context.
+
+    This is deliberately fail-open: tool failures are reported in state and in
+    prompt context, but they never block the original patch-generation flow.
+    """
+
+    repo_root = (state.get("repo_root") or "").strip()
+    metadata: dict[str, Any] = {
+        "enabled": False,
+        "executed_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "elapsed_ms": 0.0,
+        "reason": "repo_root_missing",
+    }
+    empty_trace = {
+        "calls": [],
+        "results": [],
+        "total_duration_ms": 0.0,
+        "failed_count": 0,
+        "success_count": 0,
+    }
+    if not repo_root:
+        return "", metadata, empty_trace, []
+
+    started = time.perf_counter()
+    try:
+        root_path = Path(repo_root)
+        if not root_path.exists() or not root_path.is_dir():
+            metadata["reason"] = "repo_root_not_found"
+            return "", metadata, empty_trace, []
+
+        failing_tests = state.get("failing_tests", [])
+        query = "\n".join(
+            [
+                state.get("user_request", ""),
+                error_log[:2000],
+                "\n".join(failing_tests),
+            ]
+        )
+        tool_calls = [
+            ToolCall(
+                name="list_files",
+                arguments={"repo_root": repo_root, "max_results": 120},
+            ),
+            ToolCall(
+                name="search_code",
+                arguments={
+                    "repo_root": repo_root,
+                    "query": query,
+                    "error_log": error_log,
+                    "failing_tests": failing_tests,
+                    "target_file": state.get("target_file", ""),
+                    "top_k": 5,
+                },
+            ),
+        ]
+        if state.get("target_file"):
+            tool_calls.append(
+                ToolCall(
+                    name="read_file",
+                    arguments={
+                        "repo_root": repo_root,
+                        "path": state.get("target_file", ""),
+                        "max_chars": 12000,
+                    },
+                )
+            )
+        if state.get("enable_test_tool") and state.get("test_command"):
+            tool_calls.append(
+                ToolCall(
+                    name="run_tests",
+                    arguments={
+                        "repo_root": repo_root,
+                        "command": state.get("test_command", ""),
+                        "timeout_seconds": 60,
+                        "max_output_chars": 12000,
+                    },
+                )
+            )
+        if (root_path / ".git").exists():
+            tool_calls.append(
+                ToolCall(
+                    name="git_diff",
+                    arguments={"repo_root": repo_root, "max_chars": 12000},
+                )
+            )
+
+        trace = ToolExecutor(build_default_registry()).execute_many(tool_calls)
+        context = ToolContextBuilder(max_context_chars=8000).build_context(trace=trace)
+        trace_dict = trace.to_dict()
+        results = [result.to_dict() for result in trace.results]
+        metadata.update(
+            {
+                "enabled": True,
+                "executed_count": len(tool_calls),
+                "success_count": trace.success_count,
+                "failed_count": trace.failed_count,
+                "reason": "ok",
+            }
+        )
+        return context, metadata, trace_dict, results
+    except Exception as exc:  # pragma: no cover - exact failures are environment-specific.
+        metadata["reason"] = f"tool_calling_failed:{type(exc).__name__}"
+        logger.warning("[Tools] Tool calling failed; falling back without tools: %s", exc)
+        return "", metadata, empty_trace, []
     finally:
         metadata["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
@@ -331,6 +446,29 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
     elif state.get("repo_root"):
         logger.info("[RAG] disabled reason=%s", rag_metadata.get("reason"))
 
+    tool_context, tool_metadata, tool_trace, tool_results = _build_tool_calling_context(
+        state,
+        error_log=error_log,
+    )
+    tool_state_update = {
+        "tool_context": tool_context,
+        "tool_metadata": tool_metadata,
+        "tool_trace": tool_trace,
+        "tool_results": tool_results,
+    }
+    if tool_context:
+        user_prompt = f"{user_prompt}\n\n{tool_context}\n"
+        logger.info(
+            "[Tools] enabled=%s executed=%d success=%d failed=%d elapsed_ms=%.2f",
+            tool_metadata.get("enabled"),
+            tool_metadata.get("executed_count", 0),
+            tool_metadata.get("success_count", 0),
+            tool_metadata.get("failed_count", 0),
+            tool_metadata.get("elapsed_ms", 0.0),
+        )
+    elif state.get("repo_root"):
+        logger.info("[Tools] disabled reason=%s", tool_metadata.get("reason"))
+
     # --------- 获取“异步 LLM 客户端”全局实例 ----------
     client = await _get_llm_client()  # [语法层] 异步懒加载，用单例锁防止多协程脏实例；内部搞定连接池
 
@@ -357,6 +495,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "error_log": f"[LLM Call Failed] {type(e).__name__}: {e}",  # 明确告知异常
             "retry_count": retry_count + 1,
             **rag_state_update,
+            **tool_state_update,
         }
 
     # -------- 业务核心：补丁输出后处理 ----------
@@ -370,6 +509,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "error_log": "",  # 不记故障但递进 retry
             "retry_count": retry_count + 1,
             **rag_state_update,
+            **tool_state_update,
         }
 
     try:
@@ -383,6 +523,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
             "error_log": f"[Patch Merge Failed] {e}",
             "retry_count": retry_count + 1,
             **rag_state_update,
+            **tool_state_update,
         }
 
     # [终极返回] 补丁合并通过，记录 retry 供 LangGraph 状态追踪
@@ -391,6 +532,7 @@ async def generate_and_fix_node(state: AgentState) -> dict[str, Any]:
         "error_log": "",         # 本轮无报错，留空明示
         "retry_count": retry_count + 1,  # [架构层] 必须自增，为 Router 熔断提供计数支撑
         **rag_state_update,
+        **tool_state_update,
     }
 
 
