@@ -1,0 +1,14 @@
+{
+  "task_id": "toy_empty_input",
+  "title": "Handle empty input in normalizer",
+  "repo_root": "toy_empty_input/repo",
+  "target_file": "normalizer.py",
+  "user_request": "Return an empty string when input text is empty or whitespace only.",
+  "error_log": "AssertionError: expected empty string for whitespace-only input",
+  "failing_tests": ["tests/test_normalizer.py::test_blank_input"],
+  "test_command": "pytest",
+  "max_iterations": 3,
+  "expected_success": true,
+  "tags": ["python", "edge-case", "single-file"],
+  "difficulty": "easy"
+}

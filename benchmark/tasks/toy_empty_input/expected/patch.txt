@@ -1,0 +1,10 @@
+```search
+def normalize(text):
+    return " ".join(text.lower().split())
+```
+```replace
+def normalize(text):
+    if not text or not text.strip():
+        return ""
+    return " ".join(text.lower().split())
+```
