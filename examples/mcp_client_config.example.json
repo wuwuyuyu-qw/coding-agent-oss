@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "coding-agent-oss": {
+      "command": "python",
+      "args": [
+        "-m",
+        "mcp_adapter.server",
+        "--repo-root",
+        "/path/to/coding-agent-oss",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}

@@ -38,3 +38,7 @@ typing-extensions>=4.10.0
 # .env 文件 + python-dotenv 是 12-Factor App 的标准做法，
 # 把"代码"和"配置/密钥"彻底分离，杜绝 API Key 进 Git 历史。
 python-dotenv>=1.0.0
+
+# --- MCP Server Adapter (optional at import time) ---
+# The adapter keeps MCP imports lazy so core Agent/tests still run without the SDK.
+mcp>=1.0.0
