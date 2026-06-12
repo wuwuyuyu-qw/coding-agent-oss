@@ -1,147 +1,265 @@
-<div align="center">
+# Coding Agent OSS
 
-# Self-Healing Coding Agent
+Coding Agent OSS is an automatic code-repair Coding Agent for real local code
+repositories. It combines repo-level context retrieval, deterministic tool
+calling, safe patch application, diff audit, reproducible benchmark reporting,
+and an MCP Server Adapter.
 
-### LangGraph · Reflexion · Docker sandbox · Production-minded defaults
+This is not a large-scale SWE-bench runner. The current benchmark suite is a
+small reproducible toy benchmark pipeline used to verify the repair plumbing and
+reporting flow.
 
-**CN:** 基于 LangGraph 的「生成 → 沙盒执行 → 路由熔断 → 可选持久化」闭环：把不可信的 LLM 输出约束在可观测、可回放的工程边界内。  
-**EN:** A LangGraph workflow that runs **generate → sandbox → route → (optional) checkpoint**, keeping LLM-produced code inside an observable, replayable boundary.
+## Overview
 
-[![CI](https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&logo=githubactions)](./.github/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
-[![Docker](https://img.shields.io/badge/docker-required-2496ED?style=flat-square&logo=docker&logoColor=white)](https://www.docker.com/)
+The project implements a self-healing repair loop:
 
-<sub>**Badge tip:** Replace the CI badge with your repo’s live status image after publishing.</sub>
+1. Load buggy code, tests, user request, error logs, and optional repository context.
+2. Retrieve relevant repository evidence with Repo-level RAG.
+3. Run deterministic pre-patch tools for file listing, search, file reads, git diff, and optional tests.
+4. Ask the LLM to produce a minimal patch.
+5. Parse, validate, dry-run, apply, rollback on failure, and audit the diff.
+6. Execute tests in a Docker sandbox and route success, retry, or circuit break.
 
-</div>
+Recent local validation: `169 passed` with `python -m pytest`.
 
----
+## Why This Project
 
-## Overview | 概述
+Raw LLM code generation is easy to demo and hard to operate safely. Real
+repository repair needs stronger boundaries:
 
-| | **English** | **中文** |
-|---|-------------|----------|
-| **Problem** | Raw LLM code execution on the host is unsafe; blind retries waste tokens and hide failures. | 在宿主机上直接执行模型生成的代码风险极高；无节制重试烧 Token 且难以审计。 |
-| **Approach** | Docker-isolated runs, dual success criteria (`exit_code` + stdout marker), smart log truncation, pooled async HTTP client, circuit breaker routing. | Docker 隔离执行、双重通过判定（退出码 + stdout 标记）、智能日志截断、异步连接池、路由熔断。 |
+- Repository context must be retrieved without dumping the whole repo into a prompt.
+- Tools must be deterministic, bounded, and auditable.
+- Patches must be parsed and validated before touching files.
+- Diff output should be inspected and summarized.
+- Evaluation should be reproducible, not just anecdotal.
+- External agents should be able to reuse safe repository-analysis tools through MCP.
 
----
+## Core Features
 
-## Architecture | 架构
+- **Repo-level RAG**: scans local repositories, chunks Python and Java-like source files, and retrieves context using user request, error logs, failing tests, and target file.
+- **Tool Calling Framework**: internal `ToolDefinition`, `ToolRegistry`, `ToolExecutor`, `ToolResult`, and `ToolTrace` abstractions for deterministic tools.
+- **Patch Engine**: supports Search/Replace and basic Unified Diff patch flows with validation, dry-run, apply, and rollback.
+- **Diff Audit**: records changed files, added/deleted lines, suspicious-change signals, and truncated diff metadata.
+- **Benchmark Report**: runs toy repair tasks in mock mode and generates JSON, Markdown, and CSV reports.
+- **MCP Server Adapter**: exposes selected internal tools as MCP tools over stdio.
+
+## Architecture
 
 ```mermaid
-flowchart LR
-  A[Actor / LLM] --> B[Sandbox / Docker]
-  B --> R[Router]
-  R -->|retry| A
-  R -->|success| S[End]
-  R -->|circuit_break| C[End]
+flowchart TD
+    A[User task and repo inputs] --> B[Repo-level RAG]
+    A --> C[Tool Calling Framework]
+    B --> D[LLM Patch Generation]
+    C --> D
+    D --> E[Patch Engine]
+    E --> F[Diff Audit]
+    F --> G[Sandbox Test Runner]
+    G --> H{Router}
+    H -->|pass| I[Success]
+    H -->|retry| D
+    H -->|limit reached| J[Circuit Break]
 ```
 
+## Workflow
 
----
+The default agent workflow remains a single-file repair loop when no
+`repo_root` is provided. Repo-aware features are additive and fail open:
 
-## 💡 Architecture & Design Rationale | 核心架构设计与亮点
+- Missing or invalid `repo_root` falls back to the original single-file flow.
+- Tool failures are recorded but do not crash the repair loop.
+- Patch Engine failures record structured state and fall back where safe.
+- Benchmark and MCP modules are optional side modules; they do not rewrite the core agent.
 
-### 1. Isomorphic Sandbox Execution (高防物理隔离沙盒)
-- **Design**: Implemented a stateless, Docker-based task runner enforcing strict boundary control.
-- **Features**: Utilized Linux `cgroups` and `namespaces` to cap resources (`mem_limit=128m`, `pids_limit=64`, `cpu_quota`). Configured read-only mounts (`ro`) and air-gapped networking (`network_disabled=True`) to prevent malicious prompt injection or container escape.
-- **亮点**: 彻底抛弃裸机执行，采用 Docker 构建无状态沙盒。深入内核层级，利用 Cgroups 压制内存与防范 Fork Bomb，彻底隔离网络与文件系统写权限，确保 Agent 与宿主机的绝对安全边界。
+## Module Breakdown
 
-### 2. High-Concurrency LLM Client Infrastructure (高并发 LLM 底层通信基建)
-- **Design**: Built a thread-safe, singleton asynchronous HTTPX client designed for high throughput.
-- **Features**: Applied the Double-Checked Locking (DCL) pattern for lazy initialization, avoiding Event Loop attachment conflicts. Customized connection pool limits (`max_connections=100`) and 4-stage granular timeouts (`read=30.0s`) to prevent socket leaks and mitigate upstream API degradation.
-- **亮点**: 弃用原生 SDK 黑盒，手搓底层 HTTPX 异步连接池。采用双重校验锁（DCL）实现安全的全局单例，配合精细的 4 阶段超时控制与优雅退役（Graceful Shutdown）机制，彻底解决高并发场景下的 FD（文件描述符）泄漏与雪崩问题。
+### Repo-level RAG
 
-### 3. Self-Healing State Machine & Precise Patching (自愈状态机与精准补丁应用)
-- **Design**: Orchestrated a robust `LangGraph` workflow with integrated circuit breakers and checkpointing.
-- **Features**: Engineered an AST/Regex-based patch application algorithm that processes LLM outputs via `Search/Replace` blocks. Implemented `re.DOTALL` logic to strip `<think>` tags, preventing Tokenizer pollution, and enabled fuzzy heuristic fallbacks to counter LLM whitespace hallucinations.
-- **亮点**: 引入 Checkpointer 实现状态持久化与断点恢复。设计基于 `<think>` 标签降噪与 Search/Replace 的精准合并算法，完美化解 LLM 排版幻觉。结合 Router 实现基于重试阈值的熔断机制，杜绝 Token 损耗黑洞。
+Located in `rag/`. The RAG path scans repository files, chunks source code, and
+uses a lightweight hybrid retrieval strategy. It is primarily keyword and
+metadata based today; it is not a FAISS/Chroma vector database pipeline.
 
-### 4. Quantitative Evaluation Pipeline (量化评估引擎)
-- **Design**: Developed an integrated evaluation harness (`eval_runner.py`) for automated benchmark testing.
-- **Features**: Facilitates systematic tracking of First-Pass Fix Rates and multi-turn Reflexion success metrics, ensuring data-driven iterative improvements.
-- **亮点**: 内置定制化的量化评测流水线，支持对 Agent 的首通率（First-Pass Rate）及反思收敛率进行系统性基准测试，将“玩具 Demo”升维至“数据驱动的工程化系统”。
+### Tool Calling Framework
 
----
+Located in `tools/`. Built-in tools include:
 
-## Repository layout | 项目结构
+- `list_files`
+- `read_file`
+- `search_code`
+- `grep_code`
+- `git_diff`
+- `run_tests`
 
-```
-coding_agent_oss/
-├── main.py                 # Graph wiring & demo entry
-├── core/                   # State, nodes, router, sandbox, patch merge
-├── tests/                  # pytest suite + fixtures
-├── eval_runner.py          # Batch async evaluation harness (JSONL)
-├── pytest.ini / .coveragerc
-├── requirements.txt
-├── requirements-dev.txt
-└── .github/workflows/ci.yml
-```
+Safety is centralized around repo-root path resolution, sensitive file blocking,
+allowlisted test commands, timeouts, and output truncation.
 
----
+### Patch Engine & Diff Audit
 
-## Quick start | 快速开始
+Located in `patching/`. The patch layer supports:
 
-**Prerequisites | 环境:** Python 3.10+, Docker running, LLM API key.
+- Search/Replace patch parsing
+- Basic Unified Diff parsing
+- Unique Search/Replace match validation
+- Dry-run
+- Apply
+- Rollback on failure
+- Git diff audit
+
+The existing `core/patch_apply.py` behavior is preserved for the original
+single-file repair path.
+
+### Benchmark & Report
+
+Located in `benchmark/`. Mock mode uses preset patch outputs for toy tasks, then
+still runs the real PatchParser, PatchValidator, PatchApplier, DiffAuditor, RAG
+retrieval, tool pass, and report generation.
+
+Report formats:
+
+- JSON for programmatic analysis
+- Markdown for human review
+- CSV for spreadsheet analysis
+
+### MCP Server Adapter
+
+Located in `mcp_adapter/`. The adapter exposes selected internal tools through
+MCP tools and keeps execution delegated to the existing `ToolRegistry` and
+`ToolExecutor`.
+
+Current scope:
+
+- Server Adapter only
+- stdio transport only
+- no MCP Client
+- no authentication system
+- `apply_patch` is not exposed
+- `run_tests` is disabled unless explicitly enabled
+
+## Quick Start
+
+Prerequisites:
+
+- Python 3.10+
+- Docker, for sandbox execution
+- An OpenAI-compatible API key for real LLM repair runs
+
+Install dependencies:
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Unix:    source .venv/bin/activate
+pip install -r requirements.txt
+```
 
+For local development and tests:
+
+```bash
 pip install -r requirements-dev.txt
-cp .env.example .env   # fill OPENAI_* variables
+```
 
-docker pull python:3.10-slim   # sandbox image (first run)
+Configure the LLM environment for real agent runs:
+
+```bash
+cp .env.example .env
+```
+
+Then set `OPENAI_API_KEY`, and optionally `OPENAI_BASE_URL` and `OPENAI_MODEL`.
+
+Run the basic app entry:
+
+```bash
 python main.py
 ```
 
----
-
-## Testing | 测试
-
-**EN:** Tests assume the repository root is on `PYTHONPATH` (handled via `tests/conftest.py`). Coverage gate is enforced in `pytest.ini` (`--cov-fail-under=80`).
-
-**CN:** `conftest.py` 已将仓库根目录加入 `sys.path`。覆盖率阈值由 `pytest.ini` 强制（默认 ≥80%）。
+## Run Tests
 
 ```bash
-pytest                         # full suite + coverage summary
-pytest tests/test_router.py -v # focused module
-pytest -k "circuit_break"      # keyword filter
-
-# HTML report (local artifact; listed in .gitignore)
-pytest && start htmlcov/index.html    # Windows
-pytest && open htmlcov/index.html     # macOS
+python -m pytest
 ```
 
----
+Focused examples:
 
-## Configuration | 配置
+```bash
+python -m pytest tests/test_nodes.py
+python -m pytest tests/test_tool_executor.py
+python -m pytest tests/test_patch_applier.py
+```
 
-| Variable | Required | Notes |
-|----------|----------|-------|
-| `OPENAI_API_KEY` | Yes | Provider key |
-| `OPENAI_BASE_URL` | No | Compatible OpenAI-style endpoint |
-| `OPENAI_MODEL` | No | Default model id |
+## Run Benchmark
 
-Tune sandbox caps in `core/sandbox.py` (`SANDBOX_*` constants).
+Run the reproducible toy benchmark pipeline:
 
----
+```bash
+python -m benchmark.cli --tasks-dir benchmark/tasks --output-dir benchmark/results --mode mock --formats json markdown csv
+```
 
-## Security disclaimer | 安全声明
+`benchmark/results/` is ignored by git.
 
-**EN:** This demo prioritizes clarity. Harden for production: dynamic pass markers, stronger isolation (e.g. gVisor/Kata), secrets management, rate limits, and outbound policy.
+## MCP Server Usage
 
-**CN:** 本仓库偏演示与学习用途。生产环境请加强隔离策略、密钥治理、动态 Marker、出口流量治理与配额控制。
+Start the MCP server adapter with stdio transport:
 
----
+```bash
+python -m mcp_adapter.server --repo-root . --transport stdio
+```
 
-## License | 许可证
+Enable the `run_tests` MCP tool explicitly:
 
-本项目采用 [MIT License](LICENSE) 开源。
+```bash
+python -m mcp_adapter.server --repo-root . --transport stdio --enable-test-tool
+```
 
----
+Example client configuration:
 
-<div align="center">
-<sub>Built with LangGraph, Docker, and defensive defaults.</sub>
-</div>
+```text
+examples/mcp_client_config.example.json
+```
+
+If the MCP Python SDK is not installed, normal Agent, RAG, Tool, Patch, and
+Benchmark tests still run. Starting the MCP server will print a clear dependency
+error.
+
+## Safety Design
+
+The project is built around defensive defaults:
+
+- Docker sandbox execution for generated code.
+- Repo-local path resolution for tools and patching.
+- Sensitive file blocking for `.git`, `.env`, private keys, token-like files, and secret-like files.
+- `run_tests` uses an allowlist and never arbitrary shell execution.
+- Subprocess calls use list arguments and `shell=False`.
+- Tool and diff outputs are truncated before entering prompts or reports.
+- Patch Engine performs validation and dry-run before applying changes.
+- Diff Audit records changed files and suspicious-change signals.
+- MCP does not expose `apply_patch` by default.
+
+## Benchmark Notes
+
+The benchmark module is intended to make repair behavior reproducible. It
+currently ships with small toy tasks and mock-mode patch outputs. It should be
+read as a local evaluation harness, not as evidence of broad real-world repair
+success.
+
+Current metrics include success count, success rate, first-pass success,
+multi-turn success, failure breakdown, patch success rate, RAG chunk count, tool
+call count, and diff size.
+
+## Limitations
+
+- Repo-level RAG is currently lightweight keyword/hybrid retrieval, not a full vector search stack.
+- Java parsing is lightweight regex-style chunking, not Tree-sitter.
+- Unified Diff support is basic and not equivalent to full `git apply` semantics for every edge case.
+- Benchmark task count is limited and toy-focused.
+- Real mode benchmark is not a complete batch evaluation of real LLM agent runs.
+- MCP support is a Server Adapter only, with stdio transport and no MCP Client implementation.
+- MCP has not been validated with an end-to-end external client integration test in this repo.
+
+## Roadmap
+
+- Expand benchmark tasks beyond toy examples.
+- Add regression benchmark suites for common repair patterns.
+- Improve retrieval with optional vector indexing.
+- Add Tree-sitter based parsing for richer multi-language support.
+- Add MCP stdio client integration tests.
+- Add optional confirmation workflows for risky tools.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
